@@ -1,0 +1,602 @@
+"""
+Admin / general utility cog.
+Server info, user info, bot info, prefix management, help command, and more.
+"""
+import datetime
+import logging
+import os
+import platform
+import re
+import shutil
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import discord
+import psutil
+from discord.ext import commands
+
+import config
+from utils.helpers import error_embed, success_embed, info_embed
+
+log = logging.getLogger("cogs.admin")
+COG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Environment/binary dependencies the media cogs need at runtime. Checked by
+# the owner-only `health` command so missing config is visible before a user
+# hits a command and gets an error embed.
+REQUIRED_BINARIES = ("ffmpeg", "ffprobe")
+REQUIRED_ENV_KEYS = (
+    ("ACE_MUSIC_API_KEY", "music generation"),
+    ("ELEVENLABS_API_KEY", "voice conversion"),
+    ("ELEVENLABS_VOICE_ID", "voice conversion"),
+)
+
+
+def _invite_permissions() -> discord.Permissions:
+    """Request the bot permissions it uses without asking for Administrator."""
+    permissions = discord.Permissions.none()
+    permissions.update(
+        view_channel=True,
+        send_messages=True,
+        embed_links=True,
+        attach_files=True,
+        read_message_history=True,
+        add_reactions=True,
+        manage_messages=True,
+        manage_channels=True,
+        manage_roles=True,
+        manage_nicknames=True,
+        kick_members=True,
+        ban_members=True,
+        moderate_members=True,
+        move_members=True,
+        mute_members=True,
+        deafen_members=True,
+        connect=True,
+        speak=True,
+        stream=True,
+        use_voice_activation=True,
+        manage_emojis_and_stickers=True,
+    )
+    return permissions
+
+
+def _ordinal(n: int) -> str:
+    s = {1: "st", 2: "nd", 3: "rd"}
+    return f"{n}{s.get(n % 10 if n % 100 not in (11, 12, 13) else 0, 'th')}"
+
+
+class Admin(commands.Cog):
+    """⚙️ Admin utilities and info commands."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self._start_time = time.time()
+
+    @staticmethod
+    def _extension_name(cog: str) -> str:
+        """Resolve an existing local cog without allowing arbitrary imports."""
+        name = cog.strip().removesuffix(".py")
+        if not COG_NAME_RE.fullmatch(name):
+            raise ValueError("Cog name may contain only letters, numbers, and underscores.")
+        if not (Path(__file__).parent / f"{name}.py").is_file():
+            raise ValueError(f"Cog `{name}` does not exist.")
+        return f"cogs.{name}"
+
+    async def _send_extension_error(self, ctx: commands.Context, action: str, exc: Exception):
+        incident_id = uuid.uuid4().hex[:8]
+        log.error("Could not %s extension [%s]: %s", action, incident_id, exc, exc_info=True)
+        await ctx.send(embed=error_embed(f"Could not {action} that cog. Reference: `{incident_id}`"))
+
+    # ── Help ───────────────────────────────────────────────────────────────────
+
+    @commands.hybrid_command(name="help", usage="help [command]")
+    async def help(self, ctx: commands.Context, *, command_name: str | None = None):
+        """Show the help menu."""
+        prefix = config.PREFIX if ctx.interaction else await self.bot._get_prefix(self.bot, ctx.message)
+        if isinstance(prefix, list):
+            prefix = prefix[0]
+
+        if command_name:
+            cmd = self.bot.get_command(command_name)
+            if not cmd:
+                return await ctx.send(embed=error_embed(f"Command `{command_name}` not found."))
+            e = discord.Embed(
+                title=f"Help: {prefix}{cmd.name}",
+                description=cmd.help or "No description.",
+                color=discord.Color.blurple()
+            )
+            if cmd.aliases:
+                e.add_field(name="Aliases", value=", ".join(f"`{a}`" for a in cmd.aliases))
+            usage = cmd.usage or cmd.name
+            e.add_field(name="Usage", value=f"`{prefix}{usage}`")
+            return await ctx.send(embed=e)
+
+        cog_order = [
+            "Admin", "🔨 Complete moderation suite.", "🎵 Music player powered by Lavalink.",
+            "⭐ XP and leveling system.", "🎲 Fun games and commands.", "📋 Detailed server event logging.",
+            "🗣️ Text-to-speech in voice channels.", "🎨 Image generation and media editing.",
+            "🏷️ Role management.", "Emoji & Stickers",
+        ]
+
+        e = discord.Embed(
+            title="📖 Bot Help",
+            description=f"Prefix: `{prefix}` | Use `{prefix}help <command>` for details.",
+            color=discord.Color.blurple()
+        )
+
+        for cog_name, cog in self.bot.cogs.items():
+            cmds = [c for c in cog.get_commands() if not c.hidden]
+            if not cmds:
+                continue
+            cmd_list = " ".join(f"`{c.name}`" for c in cmds[:15])
+            e.add_field(name=cog_name, value=cmd_list, inline=False)
+
+        e.set_footer(text=f"Total commands: {len(list(self.bot.commands))}")
+        await ctx.send(embed=e)
+
+    # ── Prefix ────────────────────────────────────────────────────────────────
+
+    @commands.command(name="setprefix", usage="setprefix <new_prefix>")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def setprefix(self, ctx: commands.Context, new_prefix: str):
+        """Change the bot's prefix for this server."""
+        new_prefix = new_prefix.strip()
+        if not new_prefix or len(new_prefix) > 10:
+            return await ctx.send(embed=error_embed("Prefix must contain 1–10 non-space characters."))
+        await self.bot.db.set_guild_prefix(ctx.guild.id, new_prefix)
+        await ctx.send(embed=success_embed(f"Prefix changed to `{new_prefix}`."))
+
+    # ── Info commands ──────────────────────────────────────────────────────────
+
+    @commands.command(name="serverinfo", aliases=["guildinfo", "si"], usage="serverinfo")
+    @commands.guild_only()
+    async def serverinfo(self, ctx: commands.Context):
+        """Show detailed server information."""
+        g = ctx.guild
+        total = g.member_count
+        bots = sum(1 for m in g.members if m.bot)
+        humans = total - bots
+
+        channels = g.channels
+        text_ch = len([c for c in channels if isinstance(c, discord.TextChannel)])
+        voice_ch = len([c for c in channels if isinstance(c, discord.VoiceChannel)])
+        categories = len(g.categories)
+
+        features = ", ".join(g.features[:5]).replace("_", " ").title() or "None"
+
+        e = discord.Embed(
+            title=f"📊 {g.name}",
+            color=discord.Color.blurple(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        if g.icon:
+            e.set_thumbnail(url=g.icon.url)
+        if g.banner:
+            e.set_image(url=g.banner.url)
+
+        e.add_field(name="Owner", value=g.owner.mention if g.owner else "Unknown")
+        e.add_field(name="ID", value=f"`{g.id}`")
+        e.add_field(name="Created", value=discord.utils.format_dt(g.created_at, "R"))
+        e.add_field(name="Members", value=f"👤 `{humans}` humans | 🤖 `{bots}` bots")
+        e.add_field(name="Channels", value=f"💬 `{text_ch}` text | 🔊 `{voice_ch}` voice | 📁 `{categories}` categories")
+        e.add_field(name="Roles", value=f"`{len(g.roles)}`")
+        e.add_field(name="Emojis", value=f"`{len(g.emojis)}`/`{g.emoji_limit}`")
+        e.add_field(name="Stickers", value=f"`{len(g.stickers)}`/`{g.sticker_limit}`")
+        e.add_field(name="Boost Level", value=f"Level `{g.premium_tier}` (`{g.premium_subscription_count}` boosts)")
+        e.add_field(name="Verification", value=str(g.verification_level).replace("_", " ").title())
+        e.add_field(name="Features", value=features, inline=False)
+        e.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=e)
+
+    @commands.command(name="userinfo", aliases=["whois", "ui"], usage="userinfo [member]")
+    @commands.guild_only()
+    async def userinfo(self, ctx: commands.Context, member: discord.Member = None):
+        """Show detailed information about a member."""
+        member = member or ctx.author
+
+        roles = [r for r in member.roles if r != ctx.guild.default_role]
+        roles.sort(key=lambda r: r.position, reverse=True)
+        role_str = " ".join(r.mention for r in roles[:15]) or "None"
+
+        # Server join position
+        sorted_members = sorted(
+            [m for m in ctx.guild.members if m.joined_at],
+            key=lambda m: m.joined_at
+        )
+        join_position = sorted_members.index(member) + 1 if member in sorted_members else "?"
+
+        # Mod history count
+        actions = await self.bot.db.get_mod_history(member.id, ctx.guild.id, 100)
+        warnings = await self.bot.db.get_warnings(member.id, ctx.guild.id)
+
+        e = discord.Embed(
+            title=f"👤 {member}",
+            color=member.color if member.color.value else discord.Color.blurple(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.add_field(name="ID", value=f"`{member.id}`")
+        e.add_field(name="Nickname", value=member.nick or "None")
+        e.add_field(name="Bot", value=str(member.bot))
+        e.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"))
+        e.add_field(
+            name="Joined Server",
+            value=f"{discord.utils.format_dt(member.joined_at, 'R')} ({_ordinal(join_position)} member)" if member.joined_at else "Unknown"
+        )
+        e.add_field(name="Booster Since", value=discord.utils.format_dt(member.premium_since, "R") if member.premium_since else "Not boosting")
+        e.add_field(name="Highest Role", value=member.top_role.mention)
+        e.add_field(name="Roles", value=role_str, inline=False)
+
+        e.add_field(name="Warnings", value=f"`{len(warnings)}`", inline=True)
+        e.add_field(name="Mod Actions", value=f"`{len(actions)}`", inline=True)
+
+        status_icon = {"online": "🟢", "idle": "🟡", "dnd": "🔴", "offline": "⚫"}
+        e.add_field(name="Status", value=f"{status_icon.get(str(member.status), '❓')} {str(member.status).title()}")
+
+        jailed = await self.bot.db.get_jailed(member.id, ctx.guild.id)
+        if jailed:
+            e.add_field(name="Jailed", value="⚠️ Yes", inline=True)
+
+        e.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=e)
+
+    @commands.command(name="botinfo", aliases=["about"], usage="botinfo")
+    async def botinfo(self, ctx: commands.Context):
+        """Show information about the bot."""
+        import discord as dpy
+        import wavelink as wl
+
+        proc = psutil.Process()
+        mem = proc.memory_info().rss / 1024 / 1024
+        cpu = psutil.cpu_percent(interval=0.1)
+        uptime_s = int(time.time() - self._start_time)
+        h, r = divmod(uptime_s, 3600)
+        m, s = divmod(r, 60)
+
+        e = discord.Embed(
+            title=f"🤖 {self.bot.user.name}",
+            color=discord.Color.blurple(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        if self.bot.user.avatar:
+            e.set_thumbnail(url=self.bot.user.avatar.url)
+
+        e.add_field(name="Developer", value="You!", inline=True)
+        e.add_field(name="Servers", value=f"`{len(self.bot.guilds)}`", inline=True)
+        e.add_field(name="Users", value=f"`{sum(g.member_count for g in self.bot.guilds):,}`", inline=True)
+        e.add_field(name="Uptime", value=f"`{h}h {m}m {s}s`", inline=True)
+        e.add_field(name="Memory", value=f"`{mem:.1f} MB`", inline=True)
+        e.add_field(name="CPU", value=f"`{cpu:.1f}%`", inline=True)
+        e.add_field(name="Commands", value=f"`{len(list(self.bot.commands))}`", inline=True)
+        e.add_field(name="Python", value=f"`{sys.version.split()[0]}`", inline=True)
+        e.add_field(name="discord.py", value=f"`{dpy.__version__}`", inline=True)
+        e.add_field(name="Wavelink", value=f"`{wl.__version__}`", inline=True)
+        e.add_field(name="Platform", value=f"`{platform.system()} {platform.release()}`", inline=False)
+        e.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        await ctx.send(embed=e)
+
+    @commands.command(name="health", hidden=True, usage="health")
+    @commands.is_owner()
+    async def health(self, ctx: commands.Context):
+        """Runtime health: database, cogs, media dependencies, AI services."""
+        failed = self.bot.failed_extensions
+
+        missing_binaries = [b for b in REQUIRED_BINARIES if shutil.which(b) is None]
+        missing_env = [
+            f"{key} ({purpose})"
+            for key, purpose in REQUIRED_ENV_KEYS
+            if not os.getenv(key, "").strip()
+        ]
+
+        healthy = bool(self.bot.db) and not failed and not missing_binaries and not missing_env
+
+        e = discord.Embed(
+            title="🩺 Bot health",
+            color=discord.Color.green() if healthy else discord.Color.orange(),
+            description="Healthy" if healthy else "Running with degraded components.",
+        )
+        e.add_field(name="Database", value="ready" if self.bot.db else "unavailable")
+        e.add_field(name="Loaded cogs", value=str(len(self.bot.loaded_extensions)))
+        e.add_field(name="Commands", value=str(len(list(self.bot.walk_commands()))))
+
+        if failed:
+            e.add_field(
+                name=f"Failed cogs ({len(failed)})",
+                value="\n".join(f"`{name}` — {reason[:70]}" for name, reason in failed.items()),
+                inline=False,
+            )
+
+        e.add_field(
+            name="Binaries",
+            value=(
+                "\n".join(f"❌ `{name}` missing" for name in missing_binaries)
+                if missing_binaries
+                else "✅ " + ", ".join(f"`{name}`" for name in REQUIRED_BINARIES)
+            ),
+            inline=False,
+        )
+
+        e.add_field(
+            name="API keys",
+            value=(
+                "\n".join(f"❌ `{entry}` not set" for entry in missing_env)
+                if missing_env
+                else "✅ all media keys present"
+            ),
+            inline=False,
+        )
+
+        # AI service registry, if utils/ai.py is present. Guarded so a broken
+        # import degrades this one field instead of failing the whole cog.
+        try:
+            from utils.ai import registry
+
+            lines = []
+            for name, service in sorted(registry.services.items()):
+                marker = " ⭐" if name == registry.default_service else ""
+                model = service.default_model or "no default model"
+                key = "keyed" if service.api_key else "no key"
+                lines.append(f"`{name}`{marker} {model} · {key}")
+
+            council = registry.council_members()
+            if council:
+                lines.append(f"council: {len(council)} member(s) → `{registry.council_aggregator()}`")
+
+            e.add_field(
+                name="AI services",
+                value="\n".join(lines)[:1000] or "none configured",
+                inline=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not raise
+            e.add_field(name="AI services", value=f"unavailable — {exc}"[:1000], inline=False)
+
+        await ctx.send(embed=e)
+
+        # The agent runtime owns the detailed cross-subsystem diagnostics. Keep
+        # this long-standing owner-only $health command as the entry point, but
+        # append the richer copyable report when that cog is loaded.
+        agent_health = self.bot.get_cog("AgentHealth")
+        if agent_health is not None and hasattr(agent_health, "_report"):
+            report = await agent_health._report(ctx, deep=False)
+            for start in range(0, len(report), 1900):
+                await ctx.send(
+                    f"```text\n{report[start:start+1900]}\n```",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+    @commands.hybrid_command(name="ping", usage="ping")
+    async def ping(self, ctx: commands.Context):
+        """Show the bot's latency."""
+        ws_latency = round(self.bot.latency * 1000)
+        start = time.perf_counter()
+        msg = await ctx.send(embed=info_embed(f"🏓 Pinging..."))
+        end = time.perf_counter()
+        msg_latency = round((end - start) * 1000)
+        await msg.edit(embed=discord.Embed(
+            title="🏓 Pong!",
+            color=discord.Color.green() if ws_latency < 100 else discord.Color.yellow(),
+            description=f"**Websocket:** `{ws_latency}ms`\n**Response:** `{msg_latency}ms`"
+        ))
+
+    @commands.command(name="invitelink", usage="invitelink")
+    async def invitelink(self, ctx: commands.Context):
+        """Get the bot's invite link."""
+        perms = _invite_permissions()
+        url = discord.utils.oauth_url(self.bot.user.id, permissions=perms)
+        e = discord.Embed(
+            title="🔗 Invite Link",
+            description=f"[Click here to invite me!]({url})",
+            color=discord.Color.blurple()
+        )
+        await ctx.send(embed=e)
+
+    # ── Cleanup ────────────────────────────────────────────────────────────────
+
+    @commands.command(name="cleanup", usage="cleanup [count]")
+    @commands.guild_only()
+    @commands.has_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def cleanup(self, ctx: commands.Context, count: int = 50):
+        """Delete the bot's own messages."""
+        if not 1 <= count <= 200:
+            return await ctx.send(embed=error_embed("Count must be between 1 and 200."))
+        await ctx.message.delete()
+        deleted = await ctx.channel.purge(
+            limit=count * 3,
+            check=lambda m: m.author == self.bot.user,
+            bulk=True
+        )
+        msg = await ctx.send(embed=success_embed(f"Cleaned up `{len(deleted)}` bot message(s)."))
+        await msg.delete(delay=4)
+
+    # ── Channel & Message utilities ────────────────────────────────────────────
+
+    @commands.command(name="say", usage="say <message>")
+    @commands.guild_only()
+    @commands.has_permissions(manage_messages=True)
+    async def say(self, ctx: commands.Context, *, message: str):
+        """Make the bot say something."""
+        await ctx.message.delete()
+        await ctx.send(message)
+
+    @commands.command(name="embed", usage="embed <title> | <description> | [color]")
+    @commands.guild_only()
+    @commands.has_permissions(manage_messages=True)
+    async def embed_cmd(self, ctx: commands.Context, *, text: str):
+        """Send a custom embed. Format: `title | description | #color`"""
+        parts = [p.strip() for p in text.split("|")]
+        title = parts[0] if len(parts) > 0 else ""
+        description = parts[1] if len(parts) > 1 else ""
+        color = discord.Color.blurple()
+        if len(parts) > 2:
+            try:
+                color = discord.Color(int(parts[2].lstrip("#"), 16))
+            except Exception:
+                pass
+        await ctx.message.delete()
+        await ctx.send(embed=discord.Embed(title=title, description=description, color=color))
+
+    @commands.command(name="announce", usage="announce <#channel> <message>")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def announce(self, ctx: commands.Context, channel: discord.TextChannel, *, message: str):
+        """Send an announcement to a channel."""
+        e = discord.Embed(
+            title="📢 Announcement",
+            description=message,
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        e.set_footer(text=f"From {ctx.guild.name}", icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
+        await channel.send(embed=e)
+        await ctx.send(embed=success_embed(f"Announcement sent to {channel.mention}."))
+
+    @commands.command(name="dm", usage="dm <member> <message>")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def dm(self, ctx: commands.Context, member: discord.Member, *, message: str):
+        """DM a member on behalf of the server."""
+        e = discord.Embed(
+            title=f"📩 Message from {ctx.guild.name}",
+            description=message,
+            color=discord.Color.blurple(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        try:
+            await member.send(embed=e)
+            await ctx.send(embed=success_embed(f"DM sent to {member.mention}."))
+        except discord.Forbidden:
+            await ctx.send(embed=error_embed(f"Could not DM {member.mention}. Their DMs may be closed."))
+
+    # ── Reload (owner only) ────────────────────────────────────────────────────
+
+    @commands.command(name="reload", usage="reload <cog>", hidden=True)
+    @commands.is_owner()
+    async def reload(self, ctx: commands.Context, cog: str):
+        """Reload a cog (owner only)."""
+        try:
+            ext = self._extension_name(cog)
+            await self.bot.reload_extension(ext)
+            await ctx.send(embed=success_embed(f"Reloaded `{ext}`."))
+        except ValueError as exc:
+            await ctx.send(embed=error_embed(str(exc)))
+        except Exception as exc:
+            await self._send_extension_error(ctx, "reload", exc)
+
+    @commands.command(name="load", usage="load <cog>", hidden=True)
+    @commands.is_owner()
+    async def load(self, ctx: commands.Context, cog: str):
+        """Load a cog (owner only)."""
+        try:
+            ext = self._extension_name(cog)
+            await self.bot.load_extension(ext)
+            if ext not in self.bot.loaded_extensions:
+                self.bot.loaded_extensions.append(ext)
+            await ctx.send(embed=success_embed(f"Loaded `{ext}`."))
+        except ValueError as exc:
+            await ctx.send(embed=error_embed(str(exc)))
+        except Exception as exc:
+            await self._send_extension_error(ctx, "load", exc)
+
+    @commands.command(name="unload", usage="unload <cog>", hidden=True)
+    @commands.is_owner()
+    async def unload(self, ctx: commands.Context, cog: str):
+        """Unload a cog (owner only)."""
+        try:
+            ext = self._extension_name(cog)
+            await self.bot.unload_extension(ext)
+            if ext in self.bot.loaded_extensions:
+                self.bot.loaded_extensions.remove(ext)
+            await ctx.send(embed=success_embed(f"Unloaded `{ext}`."))
+        except ValueError as exc:
+            await ctx.send(embed=error_embed(str(exc)))
+        except Exception as exc:
+            await self._send_extension_error(ctx, "unload", exc)
+
+    @commands.command(name="sync", usage="sync [here|clear|clearglobal]", hidden=True)
+    @commands.is_owner()
+    async def sync(self, ctx: commands.Context, scope: str = ""):
+        """Sync slash commands (owner only).
+
+        `sync` — global sync, can take up to an hour to appear.
+        `sync here` — copy globals to this server and sync, appears instantly.
+        `sync clear` — remove this server's command copies.
+        `sync clearglobal` — remove all global commands.
+        """
+        scope = scope.lower().strip()
+
+        if scope in ("here", "guild", ".") and ctx.guild is None:
+            return await ctx.send(embed=error_embed("That scope only works inside a server."))
+
+        status = await ctx.send(embed=info_embed("🔄 Syncing..."))
+
+        try:
+            if scope in ("here", "guild", "."):
+                self.bot.tree.copy_global_to(guild=ctx.guild)
+                synced = await self.bot.tree.sync(guild=ctx.guild)
+                detail = f"Synced `{len(synced)}` command(s) to **{ctx.guild.name}**. Available now."
+
+            elif scope == "clear":
+                self.bot.tree.clear_commands(guild=ctx.guild)
+                await self.bot.tree.sync(guild=ctx.guild)
+                detail = "Cleared this server's command copies. Globals are untouched."
+
+            elif scope == "clearglobal":
+                self.bot.tree.clear_commands(guild=None)
+                await self.bot.tree.sync()
+                detail = "Cleared all global commands. Re-run `sync` to restore them."
+
+            elif scope:
+                return await status.edit(embed=error_embed(
+                    "Scope must be `here`, `clear`, or `clearglobal` — or leave it off for a global sync."
+                ))
+
+            else:
+                synced = await self.bot.tree.sync()
+                detail = (
+                    f"Synced `{len(synced)}` command(s) globally. "
+                    "Discord can take up to an hour to show them — use `sync here` for instant testing."
+                )
+
+        except discord.Forbidden:
+            return await status.edit(embed=error_embed(
+                "Missing the `applications.commands` scope. Re-invite the bot with `invitelink`."
+            ))
+
+        except discord.HTTPException as exc:
+            incident_id = uuid.uuid4().hex[:8]
+            log.error("Slash sync failed [%s]: %s", incident_id, exc, exc_info=True)
+            return await status.edit(embed=error_embed(
+                f"Discord rejected the sync ({exc.status}). Syncing is rate limited — "
+                f"wait before retrying. Reference: `{incident_id}`"
+            ))
+
+        await status.edit(embed=success_embed(detail))
+
+    @commands.command(name="eval", hidden=True)
+    @commands.is_owner()
+    async def eval_cmd(self, ctx: commands.Context, *, code: str):
+        """Evaluate Python code only when the owner explicitly enables it."""
+        if not config.ENABLE_OWNER_EVAL:
+            return await ctx.send(embed=error_embed(
+                "Owner eval is disabled. Set `ENABLE_OWNER_EVAL=true` only for a short, controlled debugging session."
+            ))
+        env = {"bot": self.bot, "ctx": ctx, "guild": ctx.guild, "channel": ctx.channel, "author": ctx.author}
+        code = code.strip("```py\n").strip("`")
+        try:
+            result = eval(code, env)
+            if hasattr(result, "__await__"):
+                result = await result
+            await ctx.send(f"```py\n{result}\n```")
+        except Exception as exc:
+            incident_id = uuid.uuid4().hex[:8]
+            log.error("Owner eval failed [%s]: %s", incident_id, exc, exc_info=True)
+            await ctx.send(embed=error_embed(f"Evaluation failed. Reference: `{incident_id}`"))
+
+
+async def setup(bot):
+    await bot.add_cog(Admin(bot))

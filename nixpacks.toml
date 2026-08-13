@@ -1,0 +1,11 @@
+# Railway build config.
+#
+# "..." keeps everything Nixpacks auto-detected (Python, pip, etc.) and adds to
+# it. Writing nixPkgs without the spread REPLACES the list and breaks the build.
+#
+# ffmpeg is required by `extend` in cogs/imaging.py — it pulls the last frame
+# out of the uploaded video and stitches the generated continuation back on.
+# Without it `extend` disables itself; `animate` still works.
+
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]
