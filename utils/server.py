@@ -40,6 +40,7 @@ import logging
 import os
 import time
 import uuid
+from typing import Any
 
 from aiohttp import web
 
@@ -60,7 +61,10 @@ def _env_int(name: str, default: int) -> int:
 
 
 GATEWAY_ENABLED = _env("GATEWAY_ENABLED", "true").lower() not in ("false", "0", "no")
-PORT = _env_int("API_PORT", 8080)
+# API_PORT wins if you set it, otherwise take Railway's injected PORT. Reading
+# API_PORT alone meant this bound 8080 while Railway proxied the public domain
+# to $PORT, which is what produces "Application failed to respond".
+PORT = _env_int("API_PORT", _env_int("PORT", 8080))
 COUNCIL_MODEL = _env("GATEWAY_COUNCIL_MODEL", "tweakbot-forge")
 RATE_LIMIT = _env_int("GATEWAY_RATE_LIMIT", 30)
 MAX_CONCURRENT = _env_int("GATEWAY_MAX_CONCURRENT", 8)
@@ -104,6 +108,24 @@ class APIServer:
         self.runner: web.AppRunner | None = None
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         self._hits: dict[str, collections.deque] = {}
+        # Railway proxies the public domain to exactly one port, and this server
+        # owns it. Cogs that need a browser-reachable OAuth redirect register
+        # their handler here instead of binding a second port nothing can route
+        # to. Registration is a plain dict write, so it works whether the cog
+        # loads before or after start().
+        self._oauth_handlers: dict[str, Any] = {}
+
+    @property
+    def is_running(self) -> bool:
+        return self.runner is not None
+
+    def register_oauth_callback(self, provider: str, handler) -> None:
+        """Serve <public-domain>/oauth/<provider>/callback from this server."""
+        self._oauth_handlers[provider.strip().lower()] = handler
+        log.info("Registered OAuth callback for %r on the public API server.", provider)
+
+    def unregister_oauth_callback(self, provider: str) -> None:
+        self._oauth_handlers.pop(provider.strip().lower(), None)
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -124,6 +146,9 @@ class APIServer:
         app.router.add_get("/", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_post("/v1/chat/completions", self.handle_chat)
+        # aiohttp freezes the router once the app starts, so the route is fixed
+        # here and the provider is resolved per request from the registry above.
+        app.router.add_get("/oauth/{provider}/callback", self.handle_oauth_callback)
 
         self.runner = web.AppRunner(app, access_log=None)
 
@@ -156,6 +181,12 @@ class APIServer:
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
         if request.path in ("/health", "/"):
+            return await handler(request)
+
+        # OAuth redirects arrive from the user's browser and cannot carry a
+        # gateway token. They authenticate themselves with the `state` value
+        # the initiating cog generated, which is checked inside the handler.
+        if request.path.startswith("/oauth/"):
             return await handler(request)
 
         if not TOKENS:
@@ -194,6 +225,28 @@ class APIServer:
         return True
 
     # ── handlers ─────────────────────────────────────────────────────────
+
+    async def handle_oauth_callback(self, request: web.Request) -> web.Response:
+        provider = request.match_info.get("provider", "").lower()
+        handler = self._oauth_handlers.get(provider)
+
+        if handler is None:
+            return web.Response(
+                text=(
+                    f"No OAuth handler is registered for {provider!r}. The cog "
+                    "that owns it is not loaded."
+                ),
+                status=404,
+            )
+
+        try:
+            return await handler(request)
+        except Exception:
+            log.exception("OAuth callback for %r raised.", provider)
+            return web.Response(
+                text="The login could not be completed. Return to Discord and try again.",
+                status=500,
+            )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response(
