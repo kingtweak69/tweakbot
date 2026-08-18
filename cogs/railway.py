@@ -342,6 +342,7 @@ class Railway(commands.Cog):
         self.vault = CredentialVault()
         self.pending: dict[str, OAuthPending] = {}
         self.runner: web.AppRunner | None = None
+        self.using_shared_server = False
         self._token_locks: dict[int, asyncio.Lock] = {}
         self._write_locks: dict[int, asyncio.Lock] = {}
 
@@ -356,6 +357,27 @@ class Railway(commands.Cog):
                 "Commands will report this instead of failing."
             )
             return
+
+        # Preferred path: hang the callback off the public API server, which
+        # already owns the one port the platform routes the public domain to.
+        # A second TCPSite on its own port is unreachable from
+        # OAUTH_PUBLIC_BASE_URL on Railway, so login links would never complete.
+        try:
+            from utils.server import server as api_server
+
+            if api_server.is_running or getattr(api_server, "_oauth_handlers", None) is not None:
+                api_server.register_oauth_callback("railway", self._callback)
+                self.using_shared_server = True
+                log.info(
+                    "Railway OAuth callback will be served at %s", self._redirect_uri()
+                )
+                return
+        except Exception:
+            log.warning(
+                "Could not register the Railway OAuth callback on the API server; "
+                "falling back to a standalone listener.",
+                exc_info=True,
+            )
 
         host = str(getattr(config, "OAUTH_CALLBACK_HOST", "0.0.0.0"))
         port = self._callback_port()
@@ -382,6 +404,14 @@ class Railway(commands.Cog):
         log.info("Railway OAuth callback listening on %s:%s", host, port)
 
     async def cog_unload(self) -> None:
+        if self.using_shared_server:
+            try:
+                from utils.server import server as api_server
+
+                api_server.unregister_oauth_callback("railway")
+            except Exception:
+                log.debug("Could not unregister the Railway OAuth callback.", exc_info=True)
+            self.using_shared_server = False
         if self.runner:
             await self.runner.cleanup()
             self.runner = None
@@ -1205,7 +1235,11 @@ class Railway(commands.Cog):
         lines: list[str] = []
         lines.append(f"OAuth configured: `{self._oauth_is_configured()}`")
         lines.append(f"Callback: `{self._redirect_uri()}`")
-        lines.append(f"Callback bound: `{self.runner is not None}`")
+        lines.append(
+            "Callback bound: "
+            f"`{self.using_shared_server or self.runner is not None}`"
+            + (" (public API server)" if self.using_shared_server else "")
+        )
         lines.append(f"Requested scopes: `{_trim(self._scopes(), 300)}`")
 
         data = await self._credentials(ctx.author.id)
