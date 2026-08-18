@@ -78,7 +78,7 @@ import random
 
 def bootstrap_dependencies():
     """Check and install critical dependencies before anything else runs"""
-    critical_packages = ["certifi", "requests", "charset-normalizer", "urllib3", "idna", "setuptools"]
+    critical_packages = ["discord.py", "certifi", "requests", "charset-normalizer", "urllib3", "idna", "setuptools"]
     venv_dir = ".darkgpt_venv"
     
     in_venv = hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
