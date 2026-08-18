@@ -1262,10 +1262,26 @@ class Railway(commands.Cog):
         )
         lines.append(f"Requested scopes: `{_trim(self._scopes(), 300)}`")
 
-        data = await self._credentials(ctx.author.id)
+        # Never require a linked account: this command exists precisely for the
+        # case where logging in is what is broken. _credentials() raises rather
+        # than returning None, so the error is caught and reported as a line.
+        try:
+            data = await self._credentials(ctx.author.id)
+        except RailwayError as exc:
+            data = None
+            lines.append(f"Linked account: `none` — {exc}")
+
         if not data:
-            lines.append("Linked account: `none` — run `railway login`")
-            await self._send(ctx, embed=self._embed("Railway diagnostics", "\n".join(lines)))
+            lines.append(
+                "Everything above is config state and does not need a login. "
+                "If `Callback bound` is False or `OAuth configured` is False, "
+                "fix that first — the login cannot succeed until it is right."
+            )
+            await self._send(
+                ctx,
+                embed=self._embed("Railway diagnostics", "\n".join(lines)),
+                ephemeral=True,
+            )
             return
 
         granted = str(data.get("scope") or "unknown")
