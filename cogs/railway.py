@@ -362,16 +362,27 @@ class Railway(commands.Cog):
         # already owns the one port the platform routes the public domain to.
         # A second TCPSite on its own port is unreachable from
         # OAUTH_PUBLIC_BASE_URL on Railway, so login links would never complete.
+        #
+        # Cogs load before server.start(), so is_running is always False here.
+        # GATEWAY_ENABLED is the only honest signal that the server will come
+        # up: registering against a server that never binds would leave the
+        # callback dead while reporting it as bound.
         try:
-            from utils.server import server as api_server
+            from utils.server import server as api_server, GATEWAY_ENABLED
 
-            if api_server.is_running or getattr(api_server, "_oauth_handlers", None) is not None:
+            if GATEWAY_ENABLED:
                 api_server.register_oauth_callback("railway", self._callback)
                 self.using_shared_server = True
                 log.info(
                     "Railway OAuth callback will be served at %s", self._redirect_uri()
                 )
                 return
+
+            log.warning(
+                "GATEWAY_ENABLED is false, so the public API server will not "
+                "start. Falling back to a standalone OAuth listener, which is "
+                "NOT reachable from a platform that routes only $PORT."
+            )
         except Exception:
             log.warning(
                 "Could not register the Railway OAuth callback on the API server; "
@@ -1235,10 +1246,19 @@ class Railway(commands.Cog):
         lines: list[str] = []
         lines.append(f"OAuth configured: `{self._oauth_is_configured()}`")
         lines.append(f"Callback: `{self._redirect_uri()}`")
+        if self.using_shared_server:
+            bound = "`True` — served by the public API server on $PORT"
+        elif self.runner is not None:
+            bound = (
+                f"`True` — standalone listener on port {self._callback_port()}. "
+                "NOT reachable from the public domain on Railway."
+            )
+        else:
+            bound = "`False` — no callback is listening; logins cannot complete"
+        lines.append(f"Callback bound: {bound}")
         lines.append(
-            "Callback bound: "
-            f"`{self.using_shared_server or self.runner is not None}`"
-            + (" (public API server)" if self.using_shared_server else "")
+            "Register this EXACT redirect URI in your Railway OAuth app: "
+            f"`{self._redirect_uri()}`"
         )
         lines.append(f"Requested scopes: `{_trim(self._scopes(), 300)}`")
 
