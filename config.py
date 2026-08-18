@@ -396,9 +396,12 @@ OAUTH_PUBLIC_BASE_URL: str = os.getenv(
     "OAUTH_PUBLIC_BASE_URL",
     "",
 ).strip().rstrip("/")
+# 127.0.0.1 only accepts connections from inside the container, so nothing
+# outside can ever reach the callback. Bind all interfaces by default and use
+# a reverse proxy or Railway's private network if you want it restricted.
 OAUTH_CALLBACK_HOST: str = os.getenv(
     "OAUTH_CALLBACK_HOST",
-    "127.0.0.1",
+    "0.0.0.0",
 ).strip()
 # This used to read PORT first, which meant the OAuth callback grabbed the one
 # port Railway proxies the public domain to — and utils/server.py could never
@@ -507,6 +510,53 @@ def validate_configuration() -> tuple[list[str], list[str]]:
         errors.append(
             "API_PORT and OAUTH_CALLBACK_PORT are the same; only one server "
             "can bind a port and the other will fail to start."
+        )
+
+    _injected_port = os.getenv("PORT", "").strip()
+    _on_railway = bool(os.getenv("RAILWAY_ENVIRONMENT", "").strip())
+
+    if _injected_port and _injected_port.isdigit():
+        if API_PORT != int(_injected_port):
+            errors.append(
+                f"PORT is {_injected_port} but the API server will bind "
+                f"{API_PORT}. The platform proxies the public domain to PORT, "
+                "so every request would return 'Application failed to "
+                "respond'. Unset API_PORT, or set it to PORT."
+            )
+        if OAUTH_CALLBACK_PORT == int(_injected_port):
+            errors.append(
+                f"OAUTH_CALLBACK_PORT is {OAUTH_CALLBACK_PORT}, the same port "
+                "the platform injected as PORT. The API server owns that port; "
+                "give the OAuth callback its own."
+            )
+
+    if OAUTH_CALLBACK_HOST in {"127.0.0.1", "localhost", "::1"}:
+        warnings.append(
+            f"OAUTH_CALLBACK_HOST is {OAUTH_CALLBACK_HOST}, which only accepts "
+            "connections from inside this container. OAuth logins will never "
+            "complete from a browser. Use 0.0.0.0 unless a local reverse proxy "
+            "is forwarding to it."
+        )
+
+    _gateway_on = os.getenv("GATEWAY_ENABLED", "true").strip().lower() not in {
+        "false",
+        "0",
+        "no",
+    }
+
+    if _on_railway and OAUTH_PUBLIC_BASE_URL and not _gateway_on:
+        warnings.append(
+            "GATEWAY_ENABLED is false, so the OAuth callback falls back to its "
+            f"own listener on port {OAUTH_CALLBACK_PORT}. Railway routes the "
+            "public domain to PORT only, so that port is unreachable and "
+            "`railway login` links will time out. Leave the gateway enabled on "
+            "Railway — it serves the callback on the public port."
+        )
+
+    if OAUTH_PUBLIC_BASE_URL and not OAUTH_PUBLIC_BASE_URL.startswith("https://"):
+        warnings.append(
+            "OAUTH_PUBLIC_BASE_URL is not https. OAuth providers reject "
+            "plaintext redirect URIs outside localhost."
         )
 
     if not DATABASE_URL:
