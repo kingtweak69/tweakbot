@@ -149,6 +149,7 @@ class APIServer:
         # aiohttp freezes the router once the app starts, so the route is fixed
         # here and the provider is resolved per request from the registry above.
         app.router.add_get("/oauth/{provider}/callback", self.handle_oauth_callback)
+        app.router.add_get("/oauth/{provider}/health", self.handle_oauth_health)
 
         self.runner = web.AppRunner(app, access_log=None)
 
@@ -247,6 +248,24 @@ class APIServer:
                 text="The login could not be completed. Return to Discord and try again.",
                 status=500,
             )
+
+    async def handle_oauth_health(self, request: web.Request) -> web.Response:
+        """Unauthenticated: is this provider's callback actually wired up?
+
+        Reachable in a browser with no login, which matters because this is
+        what you check when logging in is the thing that is broken.
+        """
+        provider = request.match_info.get("provider", "").lower()
+        registered = provider in self._oauth_handlers
+        return web.json_response(
+            {
+                "provider": provider,
+                "callback_registered": registered,
+                "callback_path": f"/oauth/{provider}/callback",
+                "status": "ready" if registered else "not registered",
+            },
+            status=200 if registered else 503,
+        )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response(
